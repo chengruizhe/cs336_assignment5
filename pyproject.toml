@@ -7,7 +7,6 @@ requires-python = ">=3.11,<3.13"  # Python 3.13 not yet supported for some deps
 dependencies = [
     "accelerate>=1.5.2",
     "alpaca-eval",
-    "flash-attn==2.7.4.post1",
     "jupyter>=1.1.1",
     "math-verify[antlr4-13-2]>=0.7.0",
     "pylatexenc==2.10",
@@ -29,6 +28,10 @@ include = ["cs336_alignment"]
 package = true
 no-build-isolation-package = ["flash-attn"]
 
+[project.optional-dependencies]
+gpu = [
+  "flash-attn==2.7.4.post1",
+]
 
 [tool.uv.sources]
 alpaca-eval = { git = "https://github.com/nelson-liu/alpaca_eval.git", rev = "forward_kwargs_to_vllm" }
