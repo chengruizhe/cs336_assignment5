@@ -36,7 +36,9 @@ def run_tokenize_prompt_and_output(
     output_token_ids = tokenizer(output_strs, add_special_tokens=False)["input_ids"]
     combined_token_ids = [
         prompt_ids + output_ids
-        for prompt_ids, output_ids in zip(prompt_token_ids, output_token_ids, strict=True)
+        for prompt_ids, output_ids in zip(
+            prompt_token_ids, output_token_ids, strict=True
+        )
     ]
 
     tokens = tokenizer.pad(
@@ -141,7 +143,14 @@ def run_get_response_log_probs(
                 we have not masked out the token indices corresponding to the prompt
                 or padding; that is done in the train loop.
     """
-    raise NotImplementedError
+    result = {}
+    logits = model(input_ids).logits
+    log_prob = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+    result["log_probs"] = torch.gather(log_prob, -1, labels)
+    result["token_entropy"] = (
+        run_compute_entropy(logits) if return_token_entropy else None
+    )
+    return result
 
 
 def run_compute_naive_policy_gradient_loss(
@@ -232,7 +241,17 @@ def run_sft_microbatch_train_step(
     normalize_constant: int | None = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch."""
-    raise NotImplementedError
+    loss = run_masked_normalize(
+        tensor=-policy_log_probs,
+        mask=response_mask,
+        dim=-1,
+        normalize_constant=normalize_constant,
+    ).mean()
+    loss /= gradient_accumulation_steps
+
+    loss.backward()
+    metadata = {}
+    return loss, metadata
 
 
 def run_grpo_microbatch_train_step(
@@ -296,7 +315,7 @@ def run_masked_normalize(
         torch.Tensor, the normalized sum, where masked elements
             (mask=0) don't contribute to the sum.
     """
-    raise NotImplementedError
+    return (tensor * mask).sum(dim=dim) / normalize_constant
 
 
 """
