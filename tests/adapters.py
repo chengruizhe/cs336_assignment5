@@ -291,7 +291,12 @@ def run_masked_normalize(
         torch.Tensor, the normalized sum, where masked elements
             (mask=0) don't contribute to the sum.
     """
-    return (tensor * mask).sum(dim=dim) / normalize_constant
+    return masked_normalize(
+        tensor=tensor,
+        mask=mask,
+        dim=dim,
+        normalize_constant=normalize_constant,
+    )
 
 
 """

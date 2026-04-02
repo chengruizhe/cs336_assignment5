@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import pathlib
+import random
 from datetime import datetime
 from collections.abc import Iterable
 from typing import Any
@@ -15,7 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 
-from cs336_alignment.dataset_prep import MathSFTDataset
+from cs336_alignment.dataset_prep import MathSFTDataset, QADataset, load_math
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 from cs336_alignment.run_math_baseline import evaluate_vllm
 from cs336_alignment.sft_utils import (
@@ -70,6 +71,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", default="runs/sft")
     parser.add_argument("--experiment_name", type=str, required=True)
     parser.add_argument("--train_limit", type=int, default=None)
+    parser.add_argument("--n_ei_steps", type=int, default=0)
+    parser.add_argument("--ei_batch_size", type=int, default=128)
+    parser.add_argument("--ei_num_rollouts", type=int, default=1)
+    parser.add_argument("--ei_sft_max_iters", type=int, default=200)
+    parser.add_argument("--ei_dataset_name", type=str, default="math")
 
     parser.add_argument("--max_lr", type=float, default=1e-4)
     parser.add_argument("--min_lr", type=float, default=1e-5)
@@ -388,11 +394,10 @@ def build_policy_and_tokenizer(
     return tokenizer, policy
 
 
-def build_train_and_val_data(
+def build_train_dataloader(
     args: argparse.Namespace,
     tokenizer: PreTrainedTokenizerBase,
-    logger: logging.Logger,
-) -> tuple[DataLoader, list[str], list[str], str]:
+) -> tuple[DataLoader, int, str]:
     train_split = "train_filtered" if args.train_filtered else "train"
     train_dataset = MathSFTDataset(
         split=train_split,
@@ -407,18 +412,7 @@ def build_train_and_val_data(
         collate_fn=lambda batch: collate_fn(batch, tokenizer),
         drop_last=True,
     )
-    val_prompts, val_answers = math_sft_val_data(
-        seed=args.seed,
-        prompt_type=args.prompt_type,
-        limit=args.val_limit,
-    )
-    logger.info(
-        "Dataset sizes | train=%s (split=%s), val=%s",
-        len(train_dataset),
-        train_split,
-        len(val_prompts),
-    )
-    return train_dataloader, val_prompts, val_answers, train_split
+    return train_dataloader, len(train_dataset), train_split
 
 
 def build_optimizer(
@@ -450,11 +444,13 @@ def run_sft_loop(
     metrics_path: pathlib.Path,
     logger: logging.Logger,
     wandb_run,
+    max_iters: int,
+    step_offset: int = 0,
 ) -> None:
-    progress_bar = tqdm(total=args.max_iters, desc="SFT", dynamic_ncols=True)
+    progress_bar = tqdm(total=max_iters, desc="SFT", dynamic_ncols=True)
 
     for step, batch in enumerate(cycle_dataloader(train_dataloader), start=1):
-        if step > args.max_iters:
+        if step > max_iters:
             break
 
         current_lr = get_lr_for_step(
@@ -462,29 +458,42 @@ def run_sft_loop(
             max_lr=args.max_lr,
             min_lr=args.min_lr,
             warmup_iters=args.warmup_iters,
-            max_iters=args.max_iters,
+            max_iters=max_iters,
         )
         set_optimizer_lr(opt, current_lr)
 
         input_ids = batch["input_ids"].to(args.train_device)
         response_mask = batch["response_mask"].to(args.train_device)
         labels = batch["labels"].to(args.train_device)
+        should_log_this_step = step == 1 or step % args.log_interval == 0
+        compute_token_entropy = args.train_log_token_entropy and should_log_this_step
+        try:
+            policy_outputs = get_response_log_probs(
+                model=policy,
+                input_ids=input_ids,
+                labels=labels,
+                return_token_entropy=compute_token_entropy,
+            )
+            log_probs = policy_outputs["log_probs"]
+            token_entropy = policy_outputs["token_entropy"]
 
-        policy_outputs = get_response_log_probs(
-            model=policy,
-            input_ids=input_ids,
-            labels=labels,
-            return_token_entropy=args.train_log_token_entropy,
-        )
-        log_probs = policy_outputs["log_probs"]
-        token_entropy = policy_outputs["token_entropy"]
-
-        loss, _ = sft_microbatch_train_step(
-            policy_log_probs=log_probs,
-            response_mask=response_mask,
-            gradient_accumulation_steps=args.grad_acc_steps,
-            normalize_constant=1.0,
-        )
+            loss, _ = sft_microbatch_train_step(
+                policy_log_probs=log_probs,
+                response_mask=response_mask,
+                gradient_accumulation_steps=args.grad_acc_steps,
+                normalize_constant=1.0,
+            )
+        except torch.OutOfMemoryError:
+            logger.warning(
+                "OOM at train step=%s (global_step=%s). Skipping batch and clearing CUDA cache.",
+                step,
+                step_offset + step,
+            )
+            opt.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            progress_bar.update(1)
+            continue
 
         if step % args.grad_acc_steps == 0:
             if args.max_grad_norm > 0:
@@ -495,7 +504,7 @@ def run_sft_loop(
             opt.step()
             opt.zero_grad(set_to_none=True)
 
-        if step == 1 or step % args.log_interval == 0:
+        if should_log_this_step:
             train_metrics = compute_sft_metrics(
                 log_probs=log_probs.detach(),
                 token_entropy=None if token_entropy is None else token_entropy.detach(),
@@ -506,7 +515,7 @@ def run_sft_loop(
             train_metrics["train/lr"] = current_lr
             log_metrics(
                 train_metrics,
-                step=step,
+                step=step_offset + step,
                 metrics_path=metrics_path,
                 logger=logger,
                 wandb_run=wandb_run,
@@ -519,7 +528,7 @@ def run_sft_loop(
 
         if step % args.eval_interval == 0:
             maybe_run_eval(
-                step=step,
+                step=step_offset + step,
                 policy=policy,
                 llm=llm,
                 val_prompts=val_prompts,
@@ -533,7 +542,7 @@ def run_sft_loop(
         progress_bar.update(1)
 
     progress_bar.close()
-    if args.max_iters % args.grad_acc_steps != 0:
+    if max_iters % args.grad_acc_steps != 0:
         logger.info("Applying final optimizer step for leftover accumulated gradients")
         if args.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(
@@ -542,6 +551,189 @@ def run_sft_loop(
             )
         opt.step()
         opt.zero_grad(set_to_none=True)
+
+
+def build_ei_question_pool(
+    *,
+    seed: int,
+    prompt_type: str,
+    limit: int | None,
+    dataset_name: str,
+) -> tuple[list[str], list[str]]:
+    if dataset_name == "math":
+        train_math = load_math(split="train").shuffle(seed=seed)
+        if limit is not None:
+            train_math = train_math.select(range(min(limit, len(train_math))))
+        prompts = list(train_math["problem"])
+        answers = list(train_math["answer"])
+    else:
+        raise ValueError(
+            f"Unsupported EI dataset name: {dataset_name}. Supported values: math"
+        )
+
+    qa_dataset = QADataset(
+        prompts=prompts,
+        answers=answers,
+        prompt_type=prompt_type,
+    )
+    prompts = [row["problem"] for row in qa_dataset]
+    answers = [row["expected_answer"] for row in qa_dataset]
+    return prompts, answers
+
+
+def build_ei_sft_dataloader(
+    *,
+    records: list[dict[str, Any]],
+    tokenizer: PreTrainedTokenizerBase,
+    micro_batch_size: int,
+) -> DataLoader:
+    sft_pairs = [
+        {"problem": record["prompt"], "reasoning_trace": record["response"]}
+        for record in records
+    ]
+    return DataLoader(
+        sft_pairs,
+        batch_size=micro_batch_size,
+        shuffle=True,
+        collate_fn=lambda batch: collate_fn(batch, tokenizer),
+        drop_last=False,
+    )
+
+
+def filter_correct_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    filtered_records = []
+    for record in records:
+        answer_reward = float(record["rewards"].get("answer_reward", 0.0))
+        format_reward = float(record["rewards"].get("format_reward", 0.0))
+        if answer_reward > 0 and format_reward > 0:
+            filtered_records.append(record)
+    return filtered_records
+
+
+def run_expert_iteration(
+    *,
+    args: argparse.Namespace,
+    policy: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    opt: torch.optim.Optimizer,
+    llm: LLM,
+    eval_sampling_params: SamplingParams,
+    eval_dir: pathlib.Path,
+    val_prompts: list[str],
+    val_answers: list[str],
+    metrics_path: pathlib.Path,
+    logger: logging.Logger,
+    wandb_run,
+) -> int:
+    if args.ei_num_rollouts < 1:
+        raise ValueError("--ei_num_rollouts must be >= 1")
+    if args.ei_sft_max_iters < 1:
+        raise ValueError("--ei_sft_max_iters must be >= 1")
+
+    ei_prompts, ei_answers = build_ei_question_pool(
+        seed=args.seed,
+        prompt_type=args.prompt_type,
+        limit=args.train_limit,
+        dataset_name=args.ei_dataset_name,
+    )
+    if not ei_prompts:
+        raise ValueError("EI question pool is empty. Skipping expert iteration.")
+
+    logger.info(
+        "Starting expert iteration: n_ei_steps=%s, ei_batch_size=%s, "
+        "num_rollouts=%s, ei_sft_max_iters=%s, question_pool=%s",
+        args.n_ei_steps,
+        args.ei_batch_size,
+        args.ei_num_rollouts,
+        args.ei_sft_max_iters,
+        len(ei_prompts),
+    )
+    rng = random.Random(args.seed)
+    global_step_offset = 0
+
+    for ei_step in range(1, args.n_ei_steps + 1):
+        batch_size = min(args.ei_batch_size, len(ei_prompts))
+        sampled_idx = rng.sample(range(len(ei_prompts)), k=batch_size)
+        step_prompts = [ei_prompts[idx] for idx in sampled_idx]
+        step_answers = [ei_answers[idx] for idx in sampled_idx]
+        rollout_prompts = []
+        rollout_answers = []
+        for prompt, answer in zip(step_prompts, step_answers, strict=True):
+            for _ in range(args.ei_num_rollouts):
+                rollout_prompts.append(prompt)
+                rollout_answers.append(answer)
+
+        policy.eval()
+        load_policy_into_vllm_instance(policy, llm)
+        ei_output_path = eval_dir / f"ei_step_{ei_step:03d}_samples.json"
+        sampled_records = evaluate_vllm(
+            vllm_model=llm,
+            reward_fn=r1_zero_reward_fn,
+            prompts=rollout_prompts,
+            answers=rollout_answers,
+            eval_sampling_params=eval_sampling_params,
+            output_path=ei_output_path,
+        )
+        correct_records = filter_correct_records(sampled_records)
+        correct_ratio = len(correct_records) / max(len(sampled_records), 1)
+        logger.info(
+            "EI step %s | sampled=%s, correct=%s (%.2f%%)",
+            ei_step,
+            len(sampled_records),
+            len(correct_records),
+            correct_ratio * 100.0,
+        )
+        log_metrics(
+            {
+                "ei/step": ei_step,
+                "ei/num_questions": len(step_prompts),
+                "ei/num_rollouts": args.ei_num_rollouts,
+                "ei/num_sampled": len(sampled_records),
+                "ei/num_correct": len(correct_records),
+                "ei/correct_ratio": correct_ratio,
+            },
+            step=global_step_offset,
+            metrics_path=metrics_path,
+            logger=logger,
+            wandb_run=wandb_run,
+        )
+
+        if not correct_records:
+            logger.info(
+                "No correct trajectories on EI step %s; skipping SFT update.", ei_step
+            )
+            continue
+
+        ei_train_dataloader = build_ei_sft_dataloader(
+            records=correct_records,
+            tokenizer=tokenizer,
+            micro_batch_size=args.micro_batch_size,
+        )
+        local_max_iters = args.ei_sft_max_iters
+        logger.info(
+            "EI step %s | SFT updates on %s examples for %s iterations",
+            ei_step,
+            len(correct_records),
+            local_max_iters,
+        )
+        run_sft_loop(
+            args=args,
+            policy=policy,
+            opt=opt,
+            train_dataloader=ei_train_dataloader,
+            llm=llm,
+            val_prompts=val_prompts,
+            val_answers=val_answers,
+            eval_sampling_params=eval_sampling_params,
+            eval_dir=eval_dir,
+            metrics_path=metrics_path,
+            logger=logger,
+            wandb_run=wandb_run,
+            max_iters=local_max_iters,
+            step_offset=global_step_offset,
+        )
+        global_step_offset += local_max_iters
+    return global_step_offset
 
 
 def main() -> None:
@@ -580,40 +772,73 @@ def main() -> None:
         temperature=1.0,
         top_p=1.0,
         max_tokens=1024,
+        min_tokens=4,
         stop=["</answer>"],
         include_stop_str_in_output=True,
+        seed=args.seed,
     )
 
-    logger.info("Loading training and validation datasets")
-    train_dataloader, val_prompts, val_answers, _ = build_train_and_val_data(
-        args=args,
-        tokenizer=tokenizer,
-        logger=logger,
+    logger.info("Loading validation dataset")
+    val_prompts, val_answers = math_sft_val_data(
+        seed=args.seed,
+        prompt_type=args.prompt_type,
+        limit=args.val_limit,
     )
+    logger.info("Validation size=%s", len(val_prompts))
     opt = build_optimizer(args, policy)
 
-    logger.info(
-        "Starting SFT training: max_iters=%s, micro_batch_size=%s, grad_acc_steps=%s, val_examples=%s",
-        args.max_iters,
-        args.micro_batch_size,
-        args.grad_acc_steps,
-        len(val_prompts),
-    )
-
-    run_sft_loop(
-        args=args,
-        policy=policy,
-        opt=opt,
-        train_dataloader=train_dataloader,
-        llm=llm,
-        val_prompts=val_prompts,
-        val_answers=val_answers,
-        eval_sampling_params=eval_sampling_params,
-        eval_dir=eval_dir,
-        metrics_path=metrics_path,
-        logger=logger,
-        wandb_run=wandb_run,
-    )
+    if args.n_ei_steps > 0:
+        logger.info(
+            "Running expert iteration mode: n_ei_steps=%s, ei_batch_size=%s",
+            args.n_ei_steps,
+            args.ei_batch_size,
+        )
+        final_step = run_expert_iteration(
+            args=args,
+            policy=policy,
+            tokenizer=tokenizer,
+            opt=opt,
+            llm=llm,
+            eval_sampling_params=eval_sampling_params,
+            eval_dir=eval_dir,
+            val_prompts=val_prompts,
+            val_answers=val_answers,
+            metrics_path=metrics_path,
+            logger=logger,
+            wandb_run=wandb_run,
+        )
+    else:
+        logger.info("Loading training dataset for SFT mode")
+        train_dataloader, train_size, train_split = build_train_dataloader(
+            args=args,
+            tokenizer=tokenizer,
+        )
+        logger.info("Training size=%s (split=%s)", train_size, train_split)
+        logger.info(
+            "Starting SFT training: max_iters=%s, micro_batch_size=%s, grad_acc_steps=%s, val_examples=%s, train_split=%s",
+            args.max_iters,
+            args.micro_batch_size,
+            args.grad_acc_steps,
+            len(val_prompts),
+            train_split,
+        )
+        run_sft_loop(
+            args=args,
+            policy=policy,
+            opt=opt,
+            train_dataloader=train_dataloader,
+            llm=llm,
+            val_prompts=val_prompts,
+            val_answers=val_answers,
+            eval_sampling_params=eval_sampling_params,
+            eval_dir=eval_dir,
+            metrics_path=metrics_path,
+            logger=logger,
+            wandb_run=wandb_run,
+            max_iters=args.max_iters,
+            step_offset=0,
+        )
+        final_step = args.max_iters
 
     run_final_full_val_eval(
         seed=args.seed,
@@ -625,7 +850,7 @@ def main() -> None:
         logger=logger,
         metrics_path=metrics_path,
         wandb_run=wandb_run,
-        step=args.max_iters,
+        step=final_step,
     )
     maybe_save_final_model(
         policy=policy,

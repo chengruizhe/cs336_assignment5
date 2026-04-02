@@ -95,7 +95,7 @@ class MathSFTDataset(Dataset):
     def __len__(self) -> int:
         return len(self._data)
 
-    def __getitem__(self, idx: int) -> tuple[str, str, Any]:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         item = self._data[idx]
         prompt = format_prompt(
             input_text=item["problem"],
@@ -114,22 +114,22 @@ class QADataset(Dataset):
         answers: list[str],
         prompt_type: str = "r1_zero",
     ):
-        assert len(self.prompts) == len(
-            self.answers
-        ), "Prompts and answers must have the same length."
         self.prompt_type = prompt_type
         self.prompts = prompts
         self.answers = answers
+        assert len(self.prompts) == len(
+            self.answers
+        ), "Prompts and answers must have the same length."
 
     def __len__(self) -> int:
         return len(self.answers)
 
-    def __getitem__(self, idx: int) -> tuple[str, str, Any]:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         prompt = format_prompt(
             input_text=self.prompts[idx],
             name=self.prompt_type,
         )
         return {
             "problem": prompt,
-            "answer": self.answers[idx],
+            "expected_answer": self.answers[idx],
         }
