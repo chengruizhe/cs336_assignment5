@@ -8,6 +8,14 @@ from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
 
+from cs336_alignment.sft_utils import (
+    compute_entropy,
+    get_response_log_probs,
+    masked_normalize,
+    tokenize_prompt_and_output,
+    sft_microbatch_train_step,
+)
+
 
 def run_tokenize_prompt_and_output(
     prompt_strs: list[str],
@@ -31,35 +39,11 @@ def run_tokenize_prompt_and_output(
             "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
                 a mask on the response tokens in `labels`.
     """
-    result = {}
-    prompt_token_ids = tokenizer(prompt_strs, add_special_tokens=False)["input_ids"]
-    output_token_ids = tokenizer(output_strs, add_special_tokens=False)["input_ids"]
-    combined_token_ids = [
-        prompt_ids + output_ids
-        for prompt_ids, output_ids in zip(
-            prompt_token_ids, output_token_ids, strict=True
-        )
-    ]
-
-    tokens = tokenizer.pad(
-        {"input_ids": combined_token_ids},
-        padding=True,
-        return_tensors="pt",
-    )["input_ids"]
-
-    result["input_ids"] = tokens[:, :-1]
-    result["labels"] = tokens[:, 1:]
-
-    mask = torch.zeros_like(result["labels"], dtype=torch.bool)
-    for i, (prompt_ids, output_ids) in enumerate(
-        zip(prompt_token_ids, output_token_ids, strict=True)
-    ):
-        prompt_len = len(prompt_ids)
-        output_len = len(output_ids)
-        mask[i, prompt_len - 1 : prompt_len + output_len - 1] = True
-
-    result["response_mask"] = mask
-    return result
+    return tokenize_prompt_and_output(
+        prompt_strs=prompt_strs,
+        output_strs=output_strs,
+        tokenizer=tokenizer,
+    )
 
 
 def run_compute_group_normalized_rewards(
@@ -110,8 +94,7 @@ def run_compute_group_normalized_rewards(
 
 def run_compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     """Get the entropy of the logits (i.e., entropy of the final dimension)."""
-    log_prob = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
-    return (-torch.exp(log_prob) * log_prob).sum(dim=-1)
+    return compute_entropy(logits=logits)
 
 
 def run_get_response_log_probs(
@@ -143,14 +126,12 @@ def run_get_response_log_probs(
                 we have not masked out the token indices corresponding to the prompt
                 or padding; that is done in the train loop.
     """
-    result = {}
-    logits = model(input_ids).logits
-    log_prob = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
-    result["log_probs"] = torch.gather(log_prob, -1, labels)
-    result["token_entropy"] = (
-        run_compute_entropy(logits) if return_token_entropy else None
+    return get_response_log_probs(
+        model=model,
+        input_ids=input_ids,
+        labels=labels,
+        return_token_entropy=return_token_entropy,
     )
-    return result
 
 
 def run_compute_naive_policy_gradient_loss(
@@ -241,17 +222,12 @@ def run_sft_microbatch_train_step(
     normalize_constant: int | None = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the policy gradient loss and backprop its gradients for a microbatch."""
-    loss = run_masked_normalize(
-        tensor=-policy_log_probs,
-        mask=response_mask,
-        dim=-1,
+    return sft_microbatch_train_step(
+        policy_log_probs=policy_log_probs,
+        response_mask=response_mask,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         normalize_constant=normalize_constant,
-    ).mean()
-    loss /= gradient_accumulation_steps
-
-    loss.backward()
-    metadata = {}
-    return loss, metadata
+    )
 
 
 def run_grpo_microbatch_train_step(

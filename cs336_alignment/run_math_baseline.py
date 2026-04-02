@@ -1,10 +1,11 @@
-from typing import Callable
+from typing import Callable, Any
 import pathlib
 import json
-from datasets import load_dataset, Dataset
 from vllm import LLM, SamplingParams
 
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+from cs336_alignment.dataset_prep import load_math
+from cs336_alignment.prompting import format_prompt
 
 
 def download_qwen2_5_math_1_5b():
@@ -17,16 +18,6 @@ def download_qwen2_5_math_1_5b():
     )
 
 
-def load_math(split: str | None = None) -> Dataset:
-    return load_dataset("hiyouga/math12k", split=split)
-
-
-def format_prompt(input: str, name: str) -> str:
-    with open(f"cs336_alignment/prompts/{name}.prompt") as fp:
-        prompt = fp.read()
-    return prompt.format(question=input)
-
-
 def evaluate_vllm(
     vllm_model: LLM,
     reward_fn: Callable[[str, str], dict[str, float]],
@@ -34,7 +25,7 @@ def evaluate_vllm(
     answers: list[str],
     eval_sampling_params: SamplingParams,
     output_path: pathlib.Path | None = None,
-) -> None:
+) -> list[dict[str, Any]]:
     """
     Evaluate a language model on a list of prompts,
     compute evaluation metrics, and serialize results to disk.
@@ -63,6 +54,8 @@ def evaluate_vllm(
         print("First 10 records:")
         for record in records[:10]:
             print(record)
+
+    return records
 
 
 def main():
