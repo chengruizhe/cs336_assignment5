@@ -12,7 +12,7 @@ def compute_group_normalized_rewards(
     normalize_by_std: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     assert len(rollout_responses) == len(repeated_ground_truths)
-    # breakpoint()
+
     reward_dicts = [
         reward_fn(r, a)
         for r, a in zip(rollout_responses, repeated_ground_truths, strict=True)
@@ -30,3 +30,13 @@ def compute_group_normalized_rewards(
         "mean_raw_reward": raw_rewards.mean(),
     }
     return advantages.flatten(), raw_rewards.flatten(), metadata
+
+
+def compute_naive_policy_gradient_loss(
+    raw_rewards_or_advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+) -> torch.Tensor:
+    seq_len = policy_log_probs.shape[-1]
+    rewards = einops.repeat(raw_rewards_or_advantages, "b 1 -> b s", s=seq_len)
+    return - policy_log_probs * rewards
+    
