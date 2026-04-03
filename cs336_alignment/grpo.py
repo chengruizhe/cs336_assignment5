@@ -38,5 +38,24 @@ def compute_naive_policy_gradient_loss(
 ) -> torch.Tensor:
     seq_len = policy_log_probs.shape[-1]
     rewards = einops.repeat(raw_rewards_or_advantages, "b 1 -> b s", s=seq_len)
-    return - policy_log_probs * rewards
-    
+    return -policy_log_probs * rewards
+
+
+def compute_grpo_clip_loss(
+    advantages: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    cliprange: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    assert old_log_probs.shape == policy_log_probs.shape
+
+    seq_len = policy_log_probs.shape[-1]
+    prob_ratio = torch.exp(policy_log_probs - old_log_probs)
+    advantages = einops.repeat(advantages, "b 1 -> b s", s=seq_len)
+    clipped_prob_ratio = torch.clip(prob_ratio, min=1 - cliprange, max=1 + cliprange)
+
+    regular_val = prob_ratio * advantages
+    clipped_val = clipped_prob_ratio * advantages
+    min_val = torch.minimum(regular_val, clipped_val)
+    clipped = clipped_val < regular_val
+    return -min_val, {"clipped": clipped}

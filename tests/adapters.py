@@ -16,8 +16,9 @@ from cs336_alignment.sft_utils import (
     sft_microbatch_train_step,
 )
 from cs336_alignment.grpo import (
-    compute_group_normalized_rewards, 
+    compute_group_normalized_rewards,
     compute_naive_policy_gradient_loss,
+    compute_grpo_clip_loss,
 )
 
 
@@ -191,7 +192,12 @@ def run_compute_grpo_clip_loss(
             dict[str, torch.Tensor]: metadata for the GRPO-Clip loss
                 (used to compute clip fraction).
     """
-    raise NotImplementedError
+    return compute_grpo_clip_loss(
+        advantages=advantages,
+        policy_log_probs=policy_log_probs,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
 
 
 def run_compute_policy_gradient_loss(
