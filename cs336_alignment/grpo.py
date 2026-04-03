@@ -100,3 +100,12 @@ def compute_policy_gradient_loss(
             )
         case _:
             raise ValueError(f"Unknown loss_type: {loss_type}")
+
+
+def masked_mean(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    dim: int | None = None,
+) -> torch.Tensor:
+    count = mask.sum(dim=dim)
+    return (tensor * mask).sum(dim=dim) / count
