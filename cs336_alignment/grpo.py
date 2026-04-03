@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Literal
 import torch
 import einops
 
@@ -59,3 +59,44 @@ def compute_grpo_clip_loss(
     min_val = torch.minimum(regular_val, clipped_val)
     clipped = clipped_val < regular_val
     return -min_val, {"clipped": clipped}
+
+
+def compute_policy_gradient_loss(
+    policy_log_probs: torch.Tensor,
+    loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"],
+    raw_rewards: torch.Tensor | None = None,
+    advantages: torch.Tensor | None = None,
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    match loss_type:
+        case "no_baseline":
+            assert raw_rewards is not None
+            return (
+                compute_naive_policy_gradient_loss(
+                    raw_rewards_or_advantages=raw_rewards,
+                    policy_log_probs=policy_log_probs,
+                ),
+                {},
+            )
+        case "reinforce_with_baseline":
+            assert advantages is not None
+            return (
+                compute_naive_policy_gradient_loss(
+                    raw_rewards_or_advantages=advantages,
+                    policy_log_probs=policy_log_probs,
+                ),
+                {},
+            )
+        case "grpo_clip":
+            assert advantages is not None
+            assert old_log_probs is not None
+            assert cliprange is not None
+            return compute_grpo_clip_loss(
+                advantages=advantages,
+                policy_log_probs=policy_log_probs,
+                old_log_probs=old_log_probs,
+                cliprange=cliprange,
+            )
+        case _:
+            raise ValueError(f"Unknown loss_type: {loss_type}")
