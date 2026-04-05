@@ -3,6 +3,17 @@ import torch
 import einops
 
 
+def _as_batch_column(values: torch.Tensor) -> torch.Tensor:
+    """Normalize per-example scalars to shape [batch, 1]."""
+    if values.ndim == 1:
+        return values.unsqueeze(-1)
+    if values.ndim == 2 and values.shape[-1] == 1:
+        return values
+    raise ValueError(
+        f"Expected rewards/advantages shape [b] or [b, 1], got {tuple(values.shape)}"
+    )
+
+
 def compute_group_normalized_rewards(
     reward_fn: Callable[[str, str], dict[str, float]],
     rollout_responses: list[str],
@@ -37,7 +48,9 @@ def compute_naive_policy_gradient_loss(
     policy_log_probs: torch.Tensor,
 ) -> torch.Tensor:
     seq_len = policy_log_probs.shape[-1]
-    rewards = einops.repeat(raw_rewards_or_advantages, "b 1 -> b s", s=seq_len)
+    rewards = einops.repeat(
+        _as_batch_column(raw_rewards_or_advantages), "b 1 -> b s", s=seq_len
+    )
     return -policy_log_probs * rewards
 
 
@@ -51,7 +64,7 @@ def compute_grpo_clip_loss(
 
     seq_len = policy_log_probs.shape[-1]
     prob_ratio = torch.exp(policy_log_probs - old_log_probs)
-    advantages = einops.repeat(advantages, "b 1 -> b s", s=seq_len)
+    advantages = einops.repeat(_as_batch_column(advantages), "b 1 -> b s", s=seq_len)
     clipped_prob_ratio = torch.clip(prob_ratio, min=1 - cliprange, max=1 + cliprange)
 
     regular_val = prob_ratio * advantages
@@ -130,6 +143,8 @@ def grpo_microbatch_train_step(
         cliprange=cliprange,
     )
     loss = masked_mean(loss, mask=response_mask, dim=-1)
-    final_loss = loss.mean() / gradient_accumulation_steps
-    final_loss.backward()
-    return final_loss, metadata
+    mean_loss = loss.mean()
+    scaled_loss = mean_loss / gradient_accumulation_steps
+    scaled_loss.backward()
+    metadata["scaled_loss"] = scaled_loss.detach()
+    return mean_loss.detach(), metadata

@@ -6,7 +6,7 @@ import pathlib
 import random
 from datetime import datetime
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import patch
 
 import torch
@@ -114,8 +114,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def setup_logging(run_dir: pathlib.Path) -> logging.Logger:
-    logger = logging.getLogger("cs336_alignment.run_sft")
+def setup_logging(run_dir: pathlib.Path, name: str) -> logging.Logger:
+    logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     logger.propagate = False
@@ -157,6 +157,15 @@ def maybe_init_wandb(args: argparse.Namespace, run_dir: pathlib.Path):
     )
 
 
+def configure_wandb_metrics(wandb_run, namespaces: Iterable[str]) -> None:
+    if wandb_run is None:
+        return
+
+    for namespace in namespaces:
+        wandb_run.define_metric(f"{namespace}/step")
+        wandb_run.define_metric(f"{namespace}/*", step_metric=f"{namespace}/step")
+
+
 def log_metrics(
     metrics: dict[str, float | int],
     *,
@@ -167,6 +176,13 @@ def log_metrics(
 ) -> None:
     serializable_metrics = dict(metrics)
     serializable_metrics["step"] = step
+    namespaces = {
+        key.split("/", 1)[0]
+        for key in serializable_metrics
+        if "/" in key and not key.endswith("/step")
+    }
+    for namespace in namespaces:
+        serializable_metrics.setdefault(f"{namespace}/step", step)
     append_jsonl(metrics_path, serializable_metrics)
 
     metric_text = ", ".join(
@@ -176,7 +192,7 @@ def log_metrics(
     logger.info(metric_text)
 
     if wandb_run is not None:
-        wandb_run.log(metrics, step=step)
+        wandb_run.log(serializable_metrics)
 
 
 def collate_fn(
@@ -199,6 +215,7 @@ def math_sft_val_data(
 ) -> tuple[list[str], list[str]]:
     math_val = MathSFTDataset(
         split="val",
+        dataset_type="math_sft",
         prompt_type=prompt_type,
         limit=limit,
         seed=seed,
@@ -396,23 +413,26 @@ def build_policy_and_tokenizer(
 
 def build_train_dataloader(
     args: argparse.Namespace,
+    batch_size: int,
+    dataset_type: Literal["math_12k", "math_sft"],
+    split: Literal["train", "train_filtered"],
     tokenizer: PreTrainedTokenizerBase,
 ) -> tuple[DataLoader, int, str]:
-    train_split = "train_filtered" if args.train_filtered else "train"
     train_dataset = MathSFTDataset(
-        split=train_split,
+        split=split,
+        dataset_type=dataset_type,
         prompt_type=args.prompt_type,
         limit=args.train_limit,
         seed=args.seed,
     )
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=args.micro_batch_size,
+        batch_size=batch_size,
         shuffle=True,
         collate_fn=lambda batch: collate_fn(batch, tokenizer),
         drop_last=True,
     )
-    return train_dataloader, len(train_dataset), train_split
+    return train_dataloader, len(train_dataset), split
 
 
 def build_optimizer(
@@ -751,8 +771,9 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    logger = setup_logging(run_dir)
+    logger = setup_logging(run_dir, name="cs336_alignment.run_sft")
     wandb_run = maybe_init_wandb(args, run_dir)
+    configure_wandb_metrics(wandb_run, ("train", "eval", "ei", "final"))
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -811,6 +832,9 @@ def main() -> None:
         logger.info("Loading training dataset for SFT mode")
         train_dataloader, train_size, train_split = build_train_dataloader(
             args=args,
+            batch_size=args.micro_batch_size,
+            dataset_type="math_sft",
+            split="train_filtered" if args.train_filtered else "train",
             tokenizer=tokenizer,
         )
         logger.info("Training size=%s (split=%s)", train_size, train_split)

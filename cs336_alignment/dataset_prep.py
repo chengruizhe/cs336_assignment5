@@ -1,6 +1,7 @@
+from functools import lru_cache
 from typing import Any
 import json
-
+from typing import Literal
 from datasets import Dataset as HFDataset, DatasetDict, load_dataset
 from huggingface_hub import hf_hub_download
 from torch.utils.data import Dataset
@@ -8,8 +9,36 @@ from torch.utils.data import Dataset
 from cs336_alignment.prompting import format_prompt
 
 
-def load_math(split: str | None = None) -> HFDataset:
-    return load_dataset("hiyouga/math12k", split=split)
+def _normalize_problem_text(problem: str) -> str:
+    return " ".join(problem.strip().split())
+
+
+@lru_cache(maxsize=1)
+def _math_sft_val_problem_set() -> frozenset[str]:
+    val_dataset = load_math_sft(split="val")
+    normalized = {_normalize_problem_text(record["problem"]) for record in val_dataset}
+    return frozenset(normalized)
+
+
+def load_math(
+    split: str | None = None,
+    *,
+    exclude_math_sft_val_overlap: bool = False,
+) -> HFDataset:
+    dataset = load_dataset("hiyouga/math12k", split=split)
+    if not exclude_math_sft_val_overlap:
+        return dataset
+    if split is None:
+        raise ValueError(
+            "exclude_math_sft_val_overlap=True requires an explicit split "
+            "(e.g., split='train')."
+        )
+
+    overlap_problems = _math_sft_val_problem_set()
+    return dataset.filter(
+        lambda record: _normalize_problem_text(record["problem"])
+        not in overlap_problems
+    )
 
 
 def _load_hf_json_array_dataset(repo_id: str, file_path: str) -> HFDataset:
@@ -83,12 +112,19 @@ class MathSFTDataset(Dataset):
         self,
         *,
         split: str,
-        prompt_type: str = "r1_zero",
+        dataset_type: Literal["math_12k", "math_sft"],
+        prompt_type: str | None = "r1_zero",
         limit: int | None = None,
         seed: int = 42,
     ):
         self.prompt_type = prompt_type
-        self._data = load_math_sft(split=split).shuffle(seed=seed)
+        if dataset_type == "math_12k":
+            self._data = load_math(
+                split=split,
+                exclude_math_sft_val_overlap=True,
+            ).shuffle(seed=seed)
+        elif dataset_type == "math_sft":
+            self._data = load_math_sft(split=split).shuffle(seed=seed)
         if limit is not None:
             self._data = self._data.select(range(min(limit, len(self._data))))
 
@@ -97,10 +133,13 @@ class MathSFTDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = self._data[idx]
-        prompt = format_prompt(
-            input_text=item["problem"],
-            name=self.prompt_type,
-        )
+        if self.prompt_type is None:
+            prompt = item["problem"]
+        else:
+            prompt = format_prompt(
+                input_text=item["problem"],
+                name=self.prompt_type,
+            )
         result = item.copy()
         result["problem"] = prompt
         return result

@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from transformers import PreTrainedTokenizerBase
 
 
@@ -128,11 +129,17 @@ def tokenize_prompt_and_output(
         )
     ]
 
-    tokens = tokenizer.pad(
-        {"input_ids": combined_token_ids},
-        padding=True,
-        return_tensors="pt",
-    )["input_ids"]
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        if tokenizer.eos_token_id is None:
+            raise ValueError("Tokenizer must define pad_token_id or eos_token_id")
+        pad_token_id = tokenizer.eos_token_id
+
+    tokens = pad_sequence(
+        [torch.tensor(ids, dtype=torch.long) for ids in combined_token_ids],
+        batch_first=True,
+        padding_value=pad_token_id,
+    )
 
     result["input_ids"] = tokens[:, :-1]
     result["labels"] = tokens[:, 1:]
